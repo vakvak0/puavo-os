@@ -391,39 +391,87 @@ test_wifi() {
 
   ifconfig wlan0 up || true
 
-  wifiscan_results=$(
-    iwlist scan 2>/dev/null \
-      | ruby -lne '
-          BEGIN { networks = {} }
+  iwlist wlan0 scan 2>"$wifistderr" \
+    | ruby -lne '
+        BEGIN { networks = {} }
 
-          if $_.match(/Signal level=(.*?) dBm/) then
-            signal_level = $1
+        if $_.match(/Signal level=(.*?) dBm/) then
+          signal_level = $1
+        end
+
+        if $_.match(/ESSID:"(.*?)"/) then
+          essid = $1
+          if signal_level then
+            networks[essid] = signal_level
           end
+        end
 
-          if $_.match(/ESSID:"(.*?)"/) then
-            essid = $1
-            if signal_level then
-              networks[essid] = signal_level
-            end
+        END {
+          networks_list = networks.keys.sort_by do |i,j|
+                            networks[i].to_i <= networks[j].to_i
+                          end
+          networks_list.each do |essid|
+            printf("%-30s %s dBm\n", essid, networks[essid])
           end
+        }
+      '
+}
 
-          END {
-            networks_list = networks.keys.sort_by do |i,j|
-                              networks[i].to_i <= networks[j].to_i
-                            end
-            networks_list.each do |essid|
-              printf("%-30s %s dBm\n", essid, networks[essid])
-            end
-          }
-        ')
-  if [ -z "$wifiscan_results" ]; then
-    wifiscan_results='No networks found.
-Maybe a problem with wireless interface?'
-    dialog --no-collapse --msgbox "$wifiscan_results" 6 48
+wifi_status() {
+  wifi="$(wc --lines "$wifistdout" | awk '{print $1}')"
+  err="$(wc --lines "$wifistderr" | awk '{print $1}')"
+  if [ "$wifi" -gt "0" ]; then
+    echo "OK"
+  elif [ "$err" -gt "0" ]; then
+    echo "Bad wifi"
+  elif [ "$wifi" -eq "0" ] && [ "$err" -eq "0" ]; then
+    echo "Scanning..."
+  fi
+}
+
+show_wifi() {
+  a="$(wc --lines "$wifistdout" | awk '{print $1}')"
+  if [ "$a" -eq "0" ]; then
+    results="$(cat "$wifistderr")
+
+No networks found.
+Maybe a problem with wireless interface?"
+    dialog --no-collapse --msgbox "$results" 9 48
     return 1
   fi
+  results=$(cat "$wifistdout")
+  dialog --no-collapse --msgbox "$results" 20 48
+}
 
-  dialog --no-collapse --msgbox "$wifiscan_results" 20 48
+test_power() {
+  ac_online=$(cat "/sys/class/power_supply/AC/online")
+
+  while sleep 0.5
+  do
+    if [ "${ac_online}" -eq "1" ] && [ "$(lsusb -t 2>/dev/null | grep 'hub' | grep 'Port 4')" ]; then
+      echo "Dock OK " > $power1stdout
+    fi
+    if [ "${ac_online}" -eq "1" ] && [ ! "$(lsusb -t 2>/dev/null | grep 'hub' | grep 'Port 4')" ]; then
+      echo "AC OK" > $power2stdout
+    fi
+  done
+}
+
+power_status() {
+  if [ -z $(cat $power1stdout)$(cat $power2stdout) ]; then
+    echo "Scanning..."
+  else
+    echo "$(cat $power1stdout)$(cat $power2stdout)"
+  fi
+}
+
+show_power() {
+  if [ -z $(cat $power1stdout)$(cat $power2stdout) ]; then
+    results="Scanning..."
+  else
+    results="$(cat $power1stdout)$(cat $power2stdout)"
+  fi
+  dialog --no-collapse --msgbox "$results" 6 48
 }
 
 if [ "$(id -u)" -ne 0 ]; then
@@ -436,24 +484,28 @@ teststderr=$(mktemp /tmp/puavo-test-hardware-bluetooth-stderr.XXXXXX)
 camerastdout=$(mktemp /tmp/puavo-test-hardware-camera-stdout.XXXXXX)
 usb1stdout=$(mktemp /tmp/puavo-test-hardware-usb1-stdout.XXXXXX)
 usb2stdout=$(mktemp /tmp/puavo-test-hardware-usb2-stdout.XXXXXX)
-
+wifistdout=$(mktemp /tmp/puavo-test-hardware-wifi-stdout.XXXXXX)
+wifistderr=$(mktemp /tmp/puavo-test-hardware-wifi-stderr.XXXXXX)
+power1stdout=$(mktemp /tmp/puavo-test-hardware-power1-stdout.XXXXXX)
+power2stdout=$(mktemp /tmp/puavo-test-hardware-power2-stdout.XXXXXX)
 
 analyze_image
 
 log_usb &
 hcitool scan > "$teststdout" 2> "$teststderr" &
+test_wifi > "$wifistdout" &
+test_power &
 
 mainmenu_default_item='audio'
 while true; do
-
-  
   response=$(dialog --stdout --default-item "$mainmenu_default_item" \
                     --menu 'Choose a test' 18 50 10 \
                audio      'Test audio devices' \
                disks      'Test disks' \
                keyboard   'Test keyboard' \
                mouse      'Test mouse/mice' \
-               wifi       'Test wireless networking' \
+               power      "$(power_status)" \
+               wifi       "$(wifi_status)" \
                bluetooth  "$(bt_test_status)" \
                camera     "$(camera_test_status)" \
                usb        "$(usb_status)" \
@@ -463,8 +515,9 @@ while true; do
     audio)      mainmenu_default_item=keyboard;   test_audio      || true ;;
     disks)      mainmenu_default_item=keyboard;   test_disks      || true ;;
     keyboard)   mainmenu_default_item=mouse;      test_keyboard   || true ;;
-    mouse)      mainmenu_default_item=wifi;       test_mouse      || true ;;
-    wifi)       mainmenu_default_item=quit;       test_wifi       || true ;;
+    mouse)      mainmenu_default_item=power;      test_mouse      || true ;;
+    power)      mainmenu_default_item=quit;       show_power      || true ;;
+    wifi)       mainmenu_default_item=quit;       show_wifi       || true ;;
     bluetooth)  mainmenu_default_item=quit;       bt_test_results || true ;;
     camera)     mainmenu_default_item=quit;       test_camera     || true ;;
     usb)        mainmenu_default_item=quit;       show_usb        || true ;;
@@ -473,6 +526,7 @@ while true; do
   esac
 done
 
-rm -f "$teststdout" "$teststderr" 00000001.jpg "$camerastdout" "$usb1stdout" "$usb2stdout"
+rm -f "$teststdout" "$teststderr" 00000001.jpg "$camerastdout" "$usb1stdout" \
+	"$usb2stdout" "$wifistdout" "$wifistderr" "$power1stdout" "$power2stdout"
 
 exit 0
